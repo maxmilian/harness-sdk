@@ -3,11 +3,18 @@ import { Agent } from '@strands-agents/sdk'
 import { bash } from '@strands-agents/sdk/vended-tools/bash'
 import { fileEditor } from '@strands-agents/sdk/vended-tools/file-editor'
 import { httpRequest } from '@strands-agents/sdk/vended-tools/http-request'
-import { notebook } from '@strands-agents/sdk/vended-tools/notebook'
+import { notebook, makeNotebook } from '@strands-agents/sdk/vended-tools/notebook'
 // --8<-- [end:basic_import]
-import { SessionManager, FileStorage } from '@strands-agents/sdk'
+import {
+  SessionManager,
+  FileStorage,
+  InterruptResponseContent,
+} from '@strands-agents/sdk'
+import { handoffToUser, HANDOFF_INTERRUPT_NAME } from '@strands-agents/sdk/vended-tools/handoff-to-user'
 import { sleep, makeSleep } from '@strands-agents/sdk/vended-tools/sleep'
 import { stop } from '@strands-agents/sdk/experimental/vended-tools/stop'
+import { webFetch, makeWebFetch } from '@strands-agents/sdk/vended-tools/web-fetch'
+import { BedrockModel } from '@strands-agents/sdk/models/bedrock'
 
 // Agent with vended tools example
 async function agentWithVendedToolsExample() {
@@ -90,6 +97,17 @@ async function notebookTaskExample() {
   // --8<-- [end:notebook_example]
 }
 
+// Notebook custom configuration example
+async function notebookMakeExample() {
+  // --8<-- [start:notebook_custom_example]
+  const notes = makeNotebook({
+    name: 'notes',
+    maxNotebookSizeBytes: 64 * 1024, // 64 KiB
+  })
+  const agent = new Agent({ tools: [notes] })
+  // --8<-- [end:notebook_custom_example]
+}
+
 // Notebook state persistence example
 async function notebookStatePersistenceExample() {
   // --8<-- [start:notebook_state_persistence]
@@ -134,6 +152,26 @@ async function combinedToolsExample() {
   // --8<-- [end:combined_tools_example]
 }
 
+// Handoff to user example
+async function handoffToUserExample() {
+  // --8<-- [start:handoff_to_user_example]
+  const agent = new Agent({
+    tools: [handoffToUser],
+    systemPrompt:
+      'Before deleting any files, call handoff_to_user to confirm with the user.',
+  })
+
+  let result = await agent.invoke('Delete all .tmp files in /workspace.')
+  const interrupt = result.interrupts?.find((i) => i.name === HANDOFF_INTERRUPT_NAME)
+  if (interrupt) {
+    console.log(interrupt.reason)
+    result = await agent.invoke([
+      new InterruptResponseContent({ interruptId: interrupt.id, response: 'confirmed' }),
+    ])
+  }
+  // --8<-- [end:handoff_to_user_example]
+}
+
 // Sleep tool example
 async function sleepExample() {
   // --8<-- [start:sleep_example]
@@ -161,4 +199,35 @@ async function stopExample() {
   })
   await agent.invoke('Summarize the changes in ./CHANGELOG.md')
   // --8<-- [end:stop_example]
+}
+
+// Web fetch example
+async function webFetchExample() {
+  // --8<-- [start:web_fetch_example]
+  const agent = new Agent({ tools: [webFetch] })
+  await agent.invoke('Summarize https://example.com/blog/post')
+  // --8<-- [end:web_fetch_example]
+}
+
+// Web fetch markdown mode example
+async function webFetchMarkdownExample() {
+  // --8<-- [start:web_fetch_markdown_example]
+  const webFetch = makeWebFetch({ mode: 'markdown' })
+  const agent = new Agent({ tools: [webFetch] })
+  await agent.invoke('Read https://example.com/docs and explain the architecture')
+  // --8<-- [end:web_fetch_markdown_example]
+}
+
+// Web fetch custom config example
+async function webFetchCustomExample() {
+  // --8<-- [start:web_fetch_custom_example]
+  const webFetch = makeWebFetch({
+    mode: 'agentic',
+    maxBytes: 1 * 1024 * 1024,
+    maxContentChars: 25_000,
+    model: new BedrockModel({ modelId: 'us.amazon.nova-micro-v1:0' }),
+  })
+  const agent = new Agent({ tools: [webFetch] })
+  // --8<-- [end:web_fetch_custom_example]
+  void agent
 }

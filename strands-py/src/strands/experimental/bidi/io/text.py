@@ -5,11 +5,11 @@ from typing import Any
 
 from prompt_toolkit import PromptSession
 
+from ....types.content import TextBlock
 from ..types.events import (
     BidiConnectionCloseEvent,
     BidiInterruptionEvent,
     BidiOutputEvent,
-    BidiTextInputEvent,
     BidiTranscriptStreamEvent,
 )
 from ..types.io import BidiInput, BidiOutput
@@ -25,10 +25,10 @@ class _BidiTextInput(BidiInput):
         prompt = config.get("input_prompt", "")
         self._session: PromptSession = PromptSession(prompt)
 
-    async def __call__(self) -> BidiTextInputEvent:
+    async def __call__(self) -> TextBlock:
         """Read user input from stdin."""
         text = await self._session.prompt_async()
-        return BidiTextInputEvent(text.strip(), role="user")
+        return TextBlock(text.strip())
 
 
 class _BidiTextOutput(BidiOutput):
@@ -45,21 +45,12 @@ class _BidiTextOutput(BidiOutput):
                 print("user requested connection close using the stop tool.")
                 logger.debug("connection_id=<%s> | user requested connection close", event.connection_id)
         elif isinstance(event, BidiTranscriptStreamEvent):
-            text = event["text"]
-            is_final = event["is_final"]
-            role = event["role"]
-
             logger.debug(
-                "role=<%s>, is_final=<%s>, text_length=<%d> | text transcript received",
-                role,
-                is_final,
-                len(text),
+                "role=<%s>, text_length=<%d> | text transcript received",
+                event.role,
+                len(event.delta),
             )
-
-            if not is_final:
-                text = f"Preview: {text}"
-
-            print(text)
+            print(event.delta)
 
 
 class BidiTextIO:

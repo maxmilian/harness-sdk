@@ -18,20 +18,21 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.trace import StatusCode
 
+import strands.experimental.bidi._telemetry as _telemetry
 from strands import tool
-from strands.experimental.bidi import BidiAgent, _telemetry
+from strands.experimental.bidi.agent import BidiAgent
+from strands.experimental.bidi.hooks import (
+    BidiAfterConnectionRestartEvent,
+    BidiBeforeConnectionRestartEvent,
+)
 from strands.experimental.bidi.models import BidiModel, BidiModelTimeoutError
-from strands.experimental.bidi.types.events import (
+from strands.experimental.bidi.types import (
     BidiAudioStreamEvent,
+    BidiConnectionCloseEvent,
     BidiInterruptionEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
-    BidiTextInputEvent,
     BidiUsageEvent,
-)
-from strands.experimental.hooks.events import (
-    BidiAfterConnectionRestartEvent,
-    BidiBeforeConnectionRestartEvent,
 )
 from strands.telemetry.tracer import Tracer
 from strands.types._events import ToolResultMessageEvent, ToolUseStreamEvent
@@ -85,7 +86,10 @@ def otel_setup():
 
 @pytest.fixture
 def agent():
-    return BidiAgent(model=unittest.mock.AsyncMock(spec=BidiModel), tools=[mock_tool_func])
+    model = unittest.mock.AsyncMock(spec=BidiModel)
+    model.get_connection_config.return_value = {}
+    model.restart = unittest.mock.AsyncMock()
+    return BidiAgent(model=model, tools=[mock_tool_func])
 
 
 @pytest_asyncio.fixture
@@ -299,9 +303,9 @@ async def test_tool_call_span_closed_on_error(loop, agent, agenerator, otel_setu
 async def test_connection_restart_span(loop, agent, agenerator, otel_setup):
     """Connection restart creates a span with error message."""
     timeout_error = BidiModelTimeoutError("8 minute timeout")
-    text_event = BidiTextInputEvent(text="after restart")
+    close_event = BidiConnectionCloseEvent(connection_id="test", reason="complete")
 
-    agent.model.receive = unittest.mock.Mock(side_effect=[timeout_error, agenerator([text_event])])
+    agent.model.receive = unittest.mock.Mock(side_effect=[timeout_error, agenerator([close_event])])
 
     await loop.start()
 
@@ -316,6 +320,8 @@ async def test_connection_restart_span(loop, agent, agenerator, otel_setup):
     spans = otel_setup.get_finished_spans()
     restart_spans = [s for s in spans if "bidi_connection_restart" in s.name]
     assert len(restart_spans) == 1
+    assert restart_spans[0].attributes["gen_ai.bidi.restart_reason"] == "timeout"
+    assert restart_spans[0].attributes["gen_ai.bidi.restart_error_message"] == "8 minute timeout"
 
 
 @pytest.mark.asyncio
@@ -345,7 +351,7 @@ async def test_restart_failure_propagates_and_reports(loop, agent, agenerator):
     """A failed restart surfaces to receive(), keeps the gate closed, and fires the after-restart hook."""
     timeout_error = BidiModelTimeoutError("8 minute timeout")
     agent.model.receive = unittest.mock.Mock(side_effect=[timeout_error, agenerator([])])
-    agent.model.start = unittest.mock.AsyncMock(side_effect=[None, ConnectionError("restart failed")])
+    agent.model.restart = unittest.mock.AsyncMock(side_effect=ConnectionError("restart failed"))
 
     after_errors = []
     agent.hooks.add_callback(BidiAfterConnectionRestartEvent, lambda event: after_errors.append(event.exception))

@@ -5,6 +5,7 @@ import {
   type InvokableAgent,
   type InvokeArgs,
   type InvokeOptions,
+  LIMITS_KEYS,
   type LocalAgent,
   type localAgentSymbol,
 } from '../types/agent.js'
@@ -30,9 +31,10 @@ import type { ToolChoice, ToolSpec } from '../tools/types.js'
 import { cloneSystemPrompt, systemPromptFromData } from '../types/messages.js'
 import { normalizeError, ConcurrentInvocationError, StructuredOutputError } from '../errors.js'
 import { Model } from '../models/model.js'
+import { ModelRouter } from '../models/routing/router.js'
 import type { BaseModelConfig, StreamAggregatedResult, StreamOptions } from '../models/model.js'
 import { ModelPlugin } from '../plugins/model-plugin.js'
-import { isModelStreamEvent } from '../models/streaming.js'
+import { totalPromptTokens, isModelStreamEvent } from '../models/streaming.js'
 import { ToolRegistry } from '../registry/tool-registry.js'
 import { StateStore } from '../state-store.js'
 import { serializeStateSerializable, loadStateSerializable } from '../types/serializable.js'
@@ -43,10 +45,8 @@ import { InterventionRegistry } from '../interventions/registry.js'
 import type { LifecycleObserver } from '../types/lifecycle-observer.js'
 import { PluginRegistry } from '../plugins/registry.js'
 import { SlidingWindowConversationManager } from '../conversation-manager/sliding-window-conversation-manager.js'
-import { SummarizingConversationManager } from '../conversation-manager/summarizing-conversation-manager.js'
 import { NullConversationManager } from '../conversation-manager/null-conversation-manager.js'
 import { ConversationManager } from '../conversation-manager/conversation-manager.js'
-import { ContextOffloader } from '../vended-plugins/context-offloader/plugin.js'
 import { AgentDelegation } from './agent-delegation.js'
 import type { Storage } from '../storage/storage.js'
 import { HookRegistryImplementation } from '../hooks/registry.js'
@@ -123,6 +123,9 @@ import {
   createTokenUsageMiddleware,
 } from '../context-manager/modes/agentic/agentic-context.js'
 import { ContextManager } from '../context-manager/context-manager.js'
+import type { ContextManagerStrategy } from '../context-manager/context-manager.js'
+import { BackgroundTasks } from '../background-tasks/background-tasks.js'
+import type { BackgroundTasksConfig } from '../background-tasks/types.js'
 
 /**
  * Recursive type definition for nested tool arrays.
@@ -150,40 +153,13 @@ export type ToolList = (Tool | McpClient | Agent | ToolList)[]
 export type ToolExecutorStrategy = 'sequential' | 'concurrent'
 
 /**
- * Supported string presets for the `contextManager` parameter.
- */
-export const CONTEXT_MANAGER_STRATEGIES = ['auto', 'agentic'] as const
-type ContextManagerPreset = (typeof CONTEXT_MANAGER_STRATEGIES)[number]
-
-/**
- * Supported values for the `contextManager` parameter.
- *
- * - `"auto"`: Managed context with proactive compression + offloading.
- * - `"agentic"`: Model-driven context management via injected tools.
- * - `ContextManager` instance: Full control over strategy-driven offloading.
- * - `false`: Explicitly disable all context management (no compression, no offloading).
- */
-export type ContextManagerStrategy = ContextManagerPreset | ContextManager | false
-
-/** Benchmark-validated token threshold for offloading tool results. */
-const CONTEXT_MANAGER_MAX_RESULT_TOKENS = 1_500
-/** Higher offload threshold for agentic mode — the model manages its own context, so we preserve more inline. */
-const AGENTIC_CONTEXT_MANAGER_MAX_RESULT_TOKENS = 8_000
-/** Benchmark-validated preview token count for offloaded results. */
-const CONTEXT_MANAGER_PREVIEW_TOKENS = 750
-/** Benchmark-validated ratio of messages to summarize on overflow. */
-const CONTEXT_MANAGER_SUMMARY_RATIO = 0.3
-/** Benchmark-validated context window ratio that triggers proactive compression. */
-const CONTEXT_MANAGER_COMPRESSION_THRESHOLD = 0.85
-
-/**
  * Configuration object for creating a new Agent.
  */
 export type AgentConfig = {
   /**
-   * The model instance that the agent will use to make decisions.
-   * Accepts either a Model instance or a string representing a Bedrock model ID.
-   * When a string is provided, it will be used to create a BedrockModel instance.
+   * The model instance or router that the agent will use to make decisions.
+   * Accepts a Model, ModelRouter, or a string representing a Bedrock model ID.
+   * When a router is provided, `agent.model` remains its default concrete model.
    *
    * @example
    * ```typescript
@@ -202,7 +178,7 @@ export type AgentConfig = {
    * })
    * ```
    */
-  model?: Model<BaseModelConfig> | string
+  model?: Model<BaseModelConfig> | ModelRouter | string
   /** An initial set of messages to seed the agent's conversation history. */
   messages?: Message[] | MessageData[]
   /**
@@ -236,24 +212,23 @@ export type AgentConfig = {
   /**
    * Context management strategy that controls how messages are compressed and offloaded.
    *
-   * - `"auto"`: SummarizingConversationManager with proactive compression + ContextOffloader.
-   * - `"agentic"`: (Experimental) Lets the model drive context management via injected tools.
+   * - `"auto"`: Proactive truncation of tool results + summarization at 85% utilization.
+   * - `"agentic"`: (Experimental) Lets the model drive context management via injected tools,
+   *   with a higher truncation threshold and summarization only on overflow.
    *   This mode may change in future versions.
-   * - `ContextManager` instance: Strategy-driven offloading with overflow recovery.
+   * - `ContextManagerConfig` object: Custom strategy pipeline and stash configuration.
    * - `false`: Explicitly disable context management (no compression, no offloading).
    *
-   * When a `ContextManager` instance is provided, any co-provided `conversationManager` is ignored.
-   * Defaults to undefined (SlidingWindowConversationManager, no offloader).
-   *
-   * @remarks The offloader uses in-memory storage by default. When an agent-level
-   * `storage` is provided, the offloader uses that instead. Alternatively, provide
-   * an explicit `ContextOffloader` with its own storage via the `plugins` parameter.
+   * When set (except `false`), any co-provided `conversationManager` is ignored.
+   * Defaults to undefined (SlidingWindowConversationManager).
    */
   contextManager?: ContextManagerStrategy
   /**
    * Plugins to register with the agent.
    */
   plugins?: Plugin[]
+  /** Background tool execution configuration. */
+  backgroundTasks?: boolean | BackgroundTasksConfig
   /**
    * Retry strategy (or strategies) for failed model/tool calls.
    *
@@ -340,10 +315,10 @@ export type AgentConfig = {
    * Default storage backend for agent subsystems.
    *
    * When provided, subsystems that do not have their own explicit storage
-   * (e.g., SessionManager, ContextOffloader) resolve from this value. Each
-   * subsystem auto-namespaces under its own prefix (`session/`, `offloader/`)
-   * to avoid key collisions. Storage specified directly on a subsystem always
-   * takes precedence over this agent-level default.
+   * (e.g., SessionManager, ContextManager) resolve from this value. Each
+   * subsystem auto-namespaces under its own prefix to avoid key collisions.
+   * Storage specified directly on a subsystem always takes precedence over
+   * this agent-level default.
    */
   storage?: Storage
 }
@@ -352,45 +327,23 @@ export type AgentConfig = {
  * Resolve the contextManager facade into a concrete ConversationManager.
  *
  * When contextManager is undefined, falls back to the default SlidingWindowConversationManager.
- * When "auto", uses SummarizingConversationManager with proactive compression.
- * When "agentic", uses SummarizingConversationManager without proactive compression
- * (the agent manages its context via tools; the context manager is only a reactive safety net).
- * When a ContextManager instance, uses NullConversationManager — the ContextManager owns
- * overflow recovery via apply().
+ * When a preset, config object, or false, uses NullConversationManager —
+ * the ContextManager owns overflow recovery and proactive compression.
  */
 function resolveConversationManager(
   contextManager: ContextManagerStrategy | undefined,
   conversationManager: ConversationManager | undefined
 ): ConversationManager {
+  if (contextManager === undefined) {
+    return conversationManager ?? new SlidingWindowConversationManager({ windowSize: 40 })
+  }
   if (contextManager === false) {
     return conversationManager ?? new NullConversationManager()
   }
-  if (contextManager instanceof ContextManager) {
-    return new NullConversationManager()
+  if (conversationManager) {
+    logger.warn('contextManager is set, ignoring co-provided conversationManager')
   }
-  if (contextManager === 'agentic') {
-    return (
-      conversationManager ??
-      new SummarizingConversationManager({
-        summaryRatio: CONTEXT_MANAGER_SUMMARY_RATIO,
-      })
-    )
-  }
-  if (contextManager === 'auto') {
-    return (
-      conversationManager ??
-      new SummarizingConversationManager({
-        summaryRatio: CONTEXT_MANAGER_SUMMARY_RATIO,
-        proactiveCompression: { compressionThreshold: CONTEXT_MANAGER_COMPRESSION_THRESHOLD },
-      })
-    )
-  }
-  if (contextManager !== undefined) {
-    throw new Error(
-      `Unsupported contextManager value: "${contextManager}". Supported values: ${CONTEXT_MANAGER_STRATEGIES.map((s) => `"${s}"`).join(', ')}`
-    )
-  }
-  return conversationManager ?? new SlidingWindowConversationManager({ windowSize: 40 })
+  return new NullConversationManager()
 }
 
 /**
@@ -422,6 +375,9 @@ const DEFAULT_AGENT_ID = 'agent'
 /** Result returned by tool-execution generators, threading the AfterToolsEvent back to the main loop. */
 type ToolsExecutionResult = { message: Message; afterToolsEvent: AfterToolsEvent; toolsSkipped: boolean }
 
+/** Model reached by the middleware terminal; empty when the chain short-circuits or fails before reaching it. */
+type InvokedModelRef = { model?: Model }
+
 /**
  * Orchestrates the interaction between a model, a set of tools, and MCP clients.
  * The Agent is responsible for managing the lifecycle of tools and clients
@@ -452,6 +408,7 @@ export class Agent implements LocalAgent, InvokableAgent {
    * The model provider used by the agent for inference.
    */
   public model: Model
+  private readonly _modelRouter?: ModelRouter
 
   /**
    * The system prompt to pass to the model provider.
@@ -481,6 +438,8 @@ export class Agent implements LocalAgent, InvokableAgent {
    * The session manager for saving and restoring agent sessions, if configured.
    */
   public readonly sessionManager?: SessionManager | undefined
+
+  private _sessionId?: string
   /**
    * The memory manager for cross-session memory retrieval and storage, if configured.
    */
@@ -501,6 +460,20 @@ export class Agent implements LocalAgent, InvokableAgent {
    */
   get sandbox(): Sandbox {
     return this._sandbox || defaultSandbox.get()
+  }
+
+  /**
+   * A stable, unique identifier for the current conversation session.
+   *
+   * If a SessionManager is attached, delegates to its sessionId.
+   * Otherwise, lazily generates and caches a random 8-character hex string.
+   */
+  get sessionId(): string {
+    if (this.sessionManager) return this.sessionManager.sessionId
+    if (!this._sessionId) {
+      this._sessionId = globalThis.crypto.randomUUID().slice(0, 8)
+    }
+    return this._sessionId
   }
 
   private readonly _hooksRegistry: HookRegistryImplementation
@@ -527,6 +500,7 @@ export class Agent implements LocalAgent, InvokableAgent {
   private readonly _checkpointing: boolean
   /** Direct tool caller — created via {@link ToolCaller.create} factory. */
   private readonly _toolCaller: ToolCallerProxy
+  private readonly _backgroundTasks: BackgroundTasks | undefined
 
   /**
    * Creates an instance of the Agent.
@@ -540,7 +514,7 @@ export class Agent implements LocalAgent, InvokableAgent {
     this.name = config?.name ?? DEFAULT_AGENT_NAME
     this.id = config?.id ?? DEFAULT_AGENT_ID
     if (config?.description !== undefined) this.description = config.description
-    this.contextManager = config?.contextManager instanceof ContextManager ? config.contextManager : undefined
+    this.contextManager = ContextManager.from(config?.contextManager)
     this.sessionManager = config?.sessionManager
     this.storage = config?.storage
     this.memoryManager =
@@ -551,10 +525,18 @@ export class Agent implements LocalAgent, InvokableAgent {
           : undefined
     this._sandbox = config?.sandbox
 
-    if (typeof config?.model === 'string') {
-      this.model = new BedrockModel({ modelId: config.model })
+    const configuredModel = config?.model
+    if (typeof configuredModel === 'string') {
+      this.model = new BedrockModel({ modelId: configuredModel })
+    } else if (configuredModel instanceof ModelRouter) {
+      this._modelRouter = configuredModel
+      this.model = configuredModel.defaultModel
     } else {
-      this.model = config?.model ?? new BedrockModel()
+      this.model = configuredModel ?? new BedrockModel()
+    }
+
+    if (config?.plugins?.some((plugin) => plugin instanceof ModelRouter)) {
+      throw new Error('ModelRouter must be passed through Agent({ model }), not plugins')
     }
 
     // Validate and assign conversation manager
@@ -583,6 +565,7 @@ export class Agent implements LocalAgent, InvokableAgent {
 
     // Initialize middleware registry
     this._middlewareRegistry = new MiddlewareRegistry()
+    this._modelRouter?.attachToAgent(this)
 
     if (config?.contextManager === 'agentic') {
       this._middlewareRegistry.addInput(InvokeModelStage.Input, createTokenUsageMiddleware())
@@ -607,32 +590,44 @@ export class Agent implements LocalAgent, InvokableAgent {
     // - Retry-strategy ordering is not load-bearing for correctness: `DefaultModelRetryStrategy`
     //   guards on `event.retry`, so a user hook that already set it short-circuits
     //   the strategy regardless of registration order.
-    const hasOffloader = (config?.plugins ?? []).some((p) => p.name === 'strands:context-offloader')
     // Always register AgentDelegation so delegation semantics work regardless of
     // when a delegate tool is added (construction, plugin getTools, MCP, runtime).
     // The plugin is a no-op when no delegation tools fire.
     const hasAgentDelegation = (config?.plugins ?? []).some((p) => p.name === 'strands:agent-delegation')
-
-    const contextManagerPlugin = config?.contextManager instanceof ContextManager ? config.contextManager : undefined
+    this._backgroundTasks = config?.backgroundTasks
+      ? new BackgroundTasks(
+          config.backgroundTasks === true ? {} : config.backgroundTasks,
+          (tool, context, middlewareInterrupt) =>
+            this._toolExecutor.executeBackground(
+              {
+                agent: this,
+                middlewareRegistry: this._middlewareRegistry,
+                // Isolate mutable local trace state from overlapping agent work. OTel spans
+                // still use the global provider; local traces are not added to AgentResult.traces.
+                tracer: new Tracer(config?.traceAttributes),
+                meter: this._meter,
+                cancelSignal: context.cancelSignal,
+                toolInterrupt: context.interrupt,
+                middlewareInterrupt,
+                toolGuard: (selectedTool) => this._backgroundTasks!.assertToolCanRun(selectedTool),
+              },
+              context.toolUse,
+              tool,
+              context.invocationState,
+              (event) => this._invokeCallbacks(event)
+            )
+        )
+      : undefined
 
     this._pluginRegistry = new PluginRegistry([
+      ...(this._modelRouter ? [this._modelRouter] : []),
       this._conversationManager,
       ...retryStrategies,
       ...(config?.plugins ?? []),
+      ...(this._backgroundTasks ? [this._backgroundTasks] : []),
       ...(!hasAgentDelegation ? [new AgentDelegation()] : []),
-      ...((config?.contextManager === 'auto' || config?.contextManager === 'agentic') && !hasOffloader
-        ? [
-            new ContextOffloader({
-              maxResultTokens:
-                config?.contextManager === 'agentic'
-                  ? AGENTIC_CONTEXT_MANAGER_MAX_RESULT_TOKENS
-                  : CONTEXT_MANAGER_MAX_RESULT_TOKENS,
-              previewTokens: CONTEXT_MANAGER_PREVIEW_TOKENS,
-            }),
-          ]
-        : []),
       ...(this.memoryManager ? [this.memoryManager] : []),
-      ...(contextManagerPlugin ? [contextManagerPlugin] : []),
+      ...(this.contextManager ? [this.contextManager] : []),
       ...(config?.sessionManager ? [config.sessionManager] : []),
       new ModelPlugin(this.model),
     ])
@@ -882,18 +877,28 @@ export class Agent implements LocalAgent, InvokableAgent {
    *
    * Each cap, when set, must be a positive finite number. Fractional values
    * are accepted — harmless, and useful for token budgets derived from
-   * arithmetic.
+   * arithmetic. Unrecognized keys are rejected for the same reason: a
+   * mistyped cap name would otherwise silently apply no limit at all.
    */
   private _validateLimits(options: InvokeOptions | undefined): void {
     if (!options?.limits) return
-    const assertPositive = (name: string, value: number | undefined): void => {
+    const { limits } = options
+    const recognizedKeys = new Set<string>(LIMITS_KEYS)
+    const unrecognizedKeys = Object.keys(limits)
+      .filter((key) => !recognizedKeys.has(key))
+      .sort()
+    if (unrecognizedKeys.length > 0) {
+      throw new TypeError(
+        `limits keys [${unrecognizedKeys.join(', ')}] are not recognized caps, ` +
+          `expected one of ${LIMITS_KEYS.map((key) => `'${key}'`).join(', ')}`
+      )
+    }
+    for (const key of LIMITS_KEYS) {
+      const value = limits[key]
       if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
-        throw new TypeError(`${name} must be a positive finite number, got ${value}`)
+        throw new TypeError(`limits.${key} must be a positive finite number, got ${value}`)
       }
     }
-    assertPositive('limits.turns', options.limits.turns)
-    assertPositive('limits.outputTokens', options.limits.outputTokens)
-    assertPositive('limits.totalTokens', options.limits.totalTokens)
   }
 
   /**
@@ -1451,7 +1456,9 @@ export class Agent implements LocalAgent, InvokableAgent {
    * ```
    */
   public loadSnapshot(snapshot: Snapshot): void {
+    if (this._initialized) this._backgroundTasks?.assertCanLoadSnapshot()
     loadSnapshotInternal(this, snapshot)
+    if (this._initialized && 'state' in snapshot.data) this._backgroundTasks?._loadAppState()
   }
 
   /**
@@ -1571,6 +1578,24 @@ export class Agent implements LocalAgent, InvokableAgent {
           messages: this.messages,
         })
 
+        // Closes cycle telemetry exactly once, however the cycle exits: return,
+        // continue, throw, or the consumer closing the public iterator (which
+        // resumes the generator at the suspended yield and runs the finally).
+        // Called before building an AgentResult so its metrics include this cycle.
+        let cycleClosed = false
+        const closeCycle = (error?: Error): void => {
+          if (cycleClosed) {
+            return
+          }
+          cycleClosed = true
+          this._meter.endCycle(cycleStartTime)
+          if (error) {
+            this._tracer.endAgentLoopSpan(cycleSpan, { error })
+          } else {
+            this._tracer.endAgentLoopSpan(cycleSpan)
+          }
+        }
+
         try {
           // Normalize input and append user messages on first invocation only
           if (currentArgs !== undefined) {
@@ -1606,8 +1631,7 @@ export class Agent implements LocalAgent, InvokableAgent {
                 )
               }
 
-              this._meter.endCycle(cycleStartTime)
-              this._tracer.endAgentLoopSpan(cycleSpan)
+              closeCycle()
 
               // Schema set, model ignored the tool — drop the response and force the tool next cycle.
               // Appending the plain-text turn here would leave the conversation ending on an
@@ -1650,8 +1674,7 @@ export class Agent implements LocalAgent, InvokableAgent {
               yield this._appendMessage(modelResult.message, invocationState)
               yield this._appendMessage(toolResultMessage, invocationState)
 
-              this._meter.endCycle(cycleStartTime)
-              this._tracer.endAgentLoopSpan(cycleSpan)
+              closeCycle()
 
               result = new AgentResult({
                 stopReason: 'cancelled',
@@ -1673,8 +1696,7 @@ export class Agent implements LocalAgent, InvokableAgent {
               const priorResumePosition = resumePosition
               resumePosition = undefined
               if (priorResumePosition !== 'afterModel') {
-                this._meter.endCycle(cycleStartTime)
-                this._tracer.endAgentLoopSpan(cycleSpan)
+                closeCycle()
                 result = new AgentResult({
                   stopReason: 'checkpoint',
                   lastMessage: modelResult.message,
@@ -1693,11 +1715,12 @@ export class Agent implements LocalAgent, InvokableAgent {
           // Execute tools
           const toolsResult = yield* this.executeTools(assistantMessage, invocationState, completedToolResults)
 
-          // When the consumer breaks the stream (e.g. agent.cancel() + break),
-          // yield* returns undefined because the inner generator was closed.
+          // Reached when the consumer breaks the stream during tool execution.
+          // _streamCore's drain loop calls .return(), which runs the finally in
+          // executeTools and yields its AfterToolsEvent, and the drain's next()
+          // then completes the closed generator, so this yield* evaluates to
+          // undefined instead of unwinding.
           if (!toolsResult) {
-            this._meter.endCycle(cycleStartTime)
-            this._tracer.endAgentLoopSpan(cycleSpan)
             continue
           }
           const toolResultMessage = toolsResult.message
@@ -1705,8 +1728,6 @@ export class Agent implements LocalAgent, InvokableAgent {
           // Tools were skipped (not executed) — preserve pending state so the next resume
           // can run them.
           if (this.isCancelled && toolsResult.toolsSkipped && this._interruptState.pendingToolExecution) {
-            this._meter.endCycle(cycleStartTime)
-            this._tracer.endAgentLoopSpan(cycleSpan)
             continue
           }
 
@@ -1728,17 +1749,20 @@ export class Agent implements LocalAgent, InvokableAgent {
             this._interruptState.deactivate()
           }
 
-          this._meter.endCycle(cycleStartTime)
-          this._tracer.endAgentLoopSpan(cycleSpan)
+          closeCycle()
 
-          // Hook requested halt: exit without calling the model again
+          // Hook requested halt with content: exit without calling the model again.
           const { afterToolsEvent } = toolsResult
-          if (afterToolsEvent.endTurn) {
-            const endTurnText =
-              typeof afterToolsEvent.endTurn === 'string'
-                ? afterToolsEvent.endTurn
-                : 'Turn ended early by hook after tool execution'
-            const lastMessage = new Message({ role: 'assistant', content: [new TextBlock(endTurnText)] })
+          const endTurnValue = afterToolsEvent.endTurn
+          if (endTurnValue === true || (endTurnValue !== false && endTurnValue.length > 0)) {
+            const endTurnContent: ContentBlock[] = Array.isArray(endTurnValue)
+              ? [...endTurnValue]
+              : [
+                  new TextBlock(
+                    typeof endTurnValue === 'string' ? endTurnValue : 'Turn ended early by hook after tool execution'
+                  ),
+                ]
+            const lastMessage = new Message({ role: 'assistant', content: endTurnContent })
             yield this._appendMessage(lastMessage, invocationState)
 
             result = new AgentResult({
@@ -1783,9 +1807,10 @@ export class Agent implements LocalAgent, InvokableAgent {
             return result
           }
         } catch (error) {
-          this._meter.endCycle(cycleStartTime)
-          this._tracer.endAgentLoopSpan(cycleSpan, { error: error as Error })
+          closeCycle(error as Error)
           throw error
+        } finally {
+          closeCycle()
         }
       }
     } catch (error) {
@@ -2033,25 +2058,26 @@ export class Agent implements LocalAgent, InvokableAgent {
     if (this.systemPrompt !== undefined) {
       streamOptions.systemPrompt = this.systemPrompt
     }
-
-    // Add tool choice if provided
     if (toolChoice) {
       streamOptions.toolChoice = toolChoice
     }
 
     let attemptCount = 1
     while (true) {
-      // Estimate input tokens for the upcoming model call (non-fatal if estimation fails)
+      // An abort during retry backoff must stop before another model attempt begins.
+      this._throwIfCancelled()
+      const selectedModel = this._modelForAttempt(invocationState)
       let projectedInputTokens: number | undefined
       try {
+        // Context management continues to size against the agent's default model.
         projectedInputTokens = await this._estimateInputTokens(streamOptions)
-      } catch (e) {
-        logger.debug(`error=<${e}> | token estimation failed, proceeding without estimate`)
+      } catch (error) {
+        logger.debug(`error=<${error}> | token estimation failed, proceeding without estimate`)
       }
 
       const beforeModelCallEvent = new BeforeModelCallEvent({
         agent: this,
-        model: this.model,
+        model: selectedModel,
         invocationState,
         ...(projectedInputTokens !== undefined && { projectedInputTokens }),
       })
@@ -2078,7 +2104,7 @@ export class Agent implements LocalAgent, InvokableAgent {
         const stopData: ModelStopData = { message, stopReason: 'endTurn' }
         const afterModelCallEvent = new AfterModelCallEvent({
           agent: this,
-          model: this.model,
+          model: selectedModel,
           attemptCount,
           stopData,
           invocationState,
@@ -2086,7 +2112,7 @@ export class Agent implements LocalAgent, InvokableAgent {
         yield afterModelCallEvent
 
         if (afterModelCallEvent.retry) {
-          attemptCount += 1
+          attemptCount = this._nextAttemptCount(selectedModel, invocationState, attemptCount)
           continue
         }
 
@@ -2106,10 +2132,18 @@ export class Agent implements LocalAgent, InvokableAgent {
         }
       }
 
+      const invokedModelRef: InvokedModelRef = {}
       try {
-        const result = yield* this._invokeModelWithMiddleware(invocationState, toolChoice, projectedInputTokens)
+        const result = yield* this._invokeModelWithMiddleware(
+          invocationState,
+          selectedModel,
+          invokedModelRef,
+          toolChoice,
+          projectedInputTokens
+        )
+        const routedModel = this._modelRouter?.getRoutedModel(this, invocationState) ?? selectedModel
+        const model = invokedModelRef.model ?? selectedModel
 
-        // Accumulate token usage and model latency metrics
         this._meter.updateCycle(result.metadata)
 
         yield new ModelMessageEvent({
@@ -2119,7 +2153,6 @@ export class Agent implements LocalAgent, InvokableAgent {
           invocationState,
         })
 
-        // Handle user content redaction if guardrails blocked input
         if (result.redaction?.userMessage) {
           this._redactLastMessage(result.redaction.userMessage)
         }
@@ -2132,7 +2165,7 @@ export class Agent implements LocalAgent, InvokableAgent {
 
         const afterModelCallEvent = new AfterModelCallEvent({
           agent: this,
-          model: this.model,
+          model,
           attemptCount,
           stopData,
           invocationState,
@@ -2140,42 +2173,47 @@ export class Agent implements LocalAgent, InvokableAgent {
         yield afterModelCallEvent
 
         if (afterModelCallEvent.retry) {
-          attemptCount += 1
+          attemptCount = this._nextAttemptCount(routedModel, invocationState, attemptCount)
           continue
         }
 
         return result
       } catch (error) {
+        const routedModel = this._modelRouter?.getRoutedModel(this, invocationState) ?? selectedModel
+        // A failure before the terminal ran (e.g. in input middleware) is attributed to the routed model.
+        const failedModel = invokedModelRef.model ?? routedModel
         const modelError = normalizeError(error)
-
-        // Create error event
         const errorEvent = new AfterModelCallEvent({
           agent: this,
-          model: this.model,
+          model: failedModel,
           attemptCount,
           error: modelError,
           invocationState,
         })
-
-        // Yield error event - stream will invoke hooks
         yield errorEvent
 
-        // Let CancelledError propagate directly — no retry
-        // (we emit the AfterModelCall because we already emitted Before and we guarentee the pair)
+        // Preserve the Before/After event pair, but never retry cancellation.
         if (error instanceof CancelledError) {
           throw error
         }
 
-        // After yielding, hooks have been invoked and may have set retry
         if (errorEvent.retry) {
-          attemptCount += 1
+          attemptCount = this._nextAttemptCount(routedModel, invocationState, attemptCount)
           continue
         }
 
-        // Re-throw error
         throw error
       }
     }
+  }
+
+  private _modelForAttempt(invocationState: InvocationState): Model {
+    return this._modelRouter?.getRoutedModel(this, invocationState) ?? this.model
+  }
+
+  private _nextAttemptCount(model: Model, invocationState: InvocationState, attemptCount: number): number {
+    const nextModel = this._modelRouter?.getRoutedModel(this, invocationState)
+    return nextModel !== undefined && nextModel !== model ? 1 : attemptCount + 1
   }
 
   /**
@@ -2185,17 +2223,21 @@ export class Agent implements LocalAgent, InvokableAgent {
    * using context fields directly (not re-derived from the agent).
    *
    * @param invocationState - Per-invocation state shared across hooks and tools
+   * @param selectedModel - Model the chain starts with; middleware may replace it
+   * @param invokedModelRef - Slot filled with the model the terminal actually invoked
    * @param toolChoice - Optional tool choice to force specific tool usage
    * @returns StreamAggregatedResult from the model (or middleware short-circuit)
    */
   private async *_invokeModelWithMiddleware(
     invocationState: InvocationState,
+    selectedModel: Model,
+    invokedModelRef: InvokedModelRef,
     toolChoice?: ToolChoice,
     projectedInputTokens?: number
   ): AsyncGenerator<AgentStreamEvent, StreamAggregatedResult, undefined> {
     const context: InvokeModelContext = {
       agent: this,
-      model: this.model,
+      model: selectedModel,
       messages: this.messages.map((msg) => msg.clone()),
       ...(this.systemPrompt !== undefined && { systemPrompt: cloneSystemPrompt(this.systemPrompt) }),
       toolSpecs: deepCopy(this._toolRegistry.list().map((tool) => tool.toolSpec)) as unknown as ToolSpec[],
@@ -2217,6 +2259,7 @@ export class Agent implements LocalAgent, InvokableAgent {
       InvokeModelStage,
       context,
       async function* (ctx: InvokeModelContext): AsyncGenerator<AgentStreamEvent, InvokeModelResult, undefined> {
+        invokedModelRef.model = ctx.model
         const modelId = ctx.model.modelId
         const modelSpan = self._tracer.startModelInvokeSpan({
           messages: ctx.messages as Message[],
@@ -2224,6 +2267,7 @@ export class Agent implements LocalAgent, InvokableAgent {
           ...(ctx.systemPrompt !== undefined && { systemPrompt: ctx.systemPrompt }),
         })
 
+        let modelSpanEnded = false
         try {
           // Wrap the snapshot into a StateStore for the model provider, which expects
           // get/set methods.
@@ -2236,6 +2280,7 @@ export class Agent implements LocalAgent, InvokableAgent {
             ...(ctx.toolChoice && { toolChoice: ctx.toolChoice }),
             // Omitted when zero, so an ordinary call's options are unchanged.
             ...(ctx.dynamicTrailingBlocks ? { dynamicTrailingBlocks: ctx.dynamicTrailingBlocks } : {}),
+            ...(self.sessionManager ? { agentMetadata: { sessionId: self.sessionId } } : {}),
           }
           const gen = self._streamFromModel(ctx.model, ctx.messages as Message[], streamOptions, ctx.invocationState)
           let iterResult = await gen.next()
@@ -2252,11 +2297,19 @@ export class Agent implements LocalAgent, InvokableAgent {
             ...(usage && { usage }),
             ...(metrics && { metrics }),
           })
+          modelSpanEnded = true
 
           return { result: iterResult.value }
         } catch (error) {
           self._tracer.endModelInvokeSpan(modelSpan, { error: normalizeError(error) })
+          modelSpanEnded = true
           throw error
+        } finally {
+          // A consumer break closes this generator via .return(): finally runs but catch does not,
+          // so neither end call above fires and the span would stay open.
+          if (!modelSpanEnded) {
+            self._tracer.endModelInvokeSpan(modelSpan)
+          }
         }
       }
     )
@@ -2389,6 +2442,10 @@ export class Agent implements LocalAgent, InvokableAgent {
             tracer: this._tracer,
             meter: this._meter,
             cancelSignal: this._abortSignal,
+            ...(this._backgroundTasks && {
+              backgroundTasks: this._backgroundTasks,
+              backgroundTaskPassId: assistantMessage.trackingId,
+            }),
           },
           {
             toolUseBlocks,
@@ -2479,10 +2536,10 @@ export class Agent implements LocalAgent, InvokableAgent {
   /**
    * Estimate the input token count for the next model call.
    *
-   * Uses the token counting strategy: reads inputTokens + outputTokens
-   * from the last assistant message's metadata as a known baseline, then estimates
-   * only new messages added after it. Falls back to full estimation when no metadata
-   * is available (cold start or first call).
+   * Uses the token counting strategy: reads the total prompt the model processed (including cached
+   * tokens) plus outputTokens from the last assistant message's metadata as a known baseline, then
+   * estimates only new messages added after it. Falls back to full estimation when no metadata is
+   * available (cold start or first call).
    *
    * @param streamOptions - The stream options containing system prompt and tool specs
    * @returns Estimated input token count
@@ -2500,7 +2557,7 @@ export class Agent implements LocalAgent, InvokableAgent {
     let estimate: number
     if (lastAssistantIdx >= 0) {
       const usage = this.messages[lastAssistantIdx]!.metadata!.usage!
-      const knownBaseline = usage.inputTokens + usage.outputTokens
+      const knownBaseline = totalPromptTokens(usage) + usage.outputTokens
       const newMessages = this.messages.slice(lastAssistantIdx + 1)
       if (newMessages.length === 0) {
         estimate = knownBaseline
