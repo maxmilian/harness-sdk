@@ -34,6 +34,17 @@ logger = logging.getLogger(__name__)
 REDACTED_VALUE = "[REDACTED]"
 
 
+class _PassthroughTracer(trace_api.NoOpTracer):
+    """No-op tracer that keeps the caller's span active.
+
+    Before opentelemetry-api 1.40, ``NoOpTracer.start_span`` returns ``INVALID_SPAN``; activating
+    that via ``use_span`` would make spans the host opens inside an agent start a new trace.
+    """
+
+    def start_span(self, name: str, context: Any = None, *args: Any, **kwargs: Any) -> Span:
+        return trace_api.NonRecordingSpan(trace_api.get_current_span(context).get_span_context())
+
+
 class JSONEncoder(json.JSONEncoder):
     """Custom JSON encoder that handles non-serializable types."""
 
@@ -125,9 +136,10 @@ class Tracer:
             # relying on what happens to be globally registered (#1059).
             logger.debug("telemetry disabled via env var; using no-op tracer provider")
             self.tracer_provider = trace_api.NoOpTracerProvider()
+            self.tracer: trace_api.Tracer = _PassthroughTracer()
         else:
             self.tracer_provider = trace_api.get_tracer_provider()
-        self.tracer = self.tracer_provider.get_tracer(self.service_name)
+            self.tracer = self.tracer_provider.get_tracer(self.service_name)
         ThreadingInstrumentor().instrument()
 
         # Read OTEL_SEMCONV_STABILITY_OPT_IN environment variable

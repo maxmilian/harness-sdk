@@ -508,7 +508,7 @@ def test_metrics_client_disabled_uses_noop_meter_over_global_provider(disable_va
     """When disabled, MetricsClient creates instruments on a no-op meter provider even if a
     real provider is registered globally — mirroring the Tracer NoOp so the reported metrics
     leak (#1059) is closed, not just the span half. Reads the global meter unconditionally
-    otherwise, so gating only StrandsTelemetry setup would not silence it (poshinchen review).
+    otherwise, so gating only StrandsTelemetry setup would not silence it (#1059).
     """
     from opentelemetry.metrics import NoOpMeter
 
